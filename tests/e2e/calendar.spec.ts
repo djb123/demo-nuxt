@@ -1,0 +1,121 @@
+import { expect, test, type Page } from '@playwright/test'
+
+async function gotoHydrated(page: Page, url: string) {
+  await page.goto(url)
+  // SSR links exist before Vue attaches handlers; wait for client navigation to be ready.
+  await page.waitForFunction(() => {
+    const root = document.querySelector('#__nuxt') as (HTMLElement & {
+      __vue_app__?: { config: { globalProperties: { $nuxt?: { isHydrating: boolean } } } }
+    }) | null
+    return root?.__vue_app__?.config.globalProperties.$nuxt?.isHydrating === false
+  })
+}
+
+test('uploads, persists a calendar, assigns a photo, edits events, and renders all print months', async ({ page, context }) => {
+  const errors: string[] = []
+  page.on('pageerror', error => errors.push(error.message))
+  await gotoHydrated(page, '/')
+  await expect(page.getByRole('heading', { name: 'Welcome to the Cat Calendar Creator!' })).toBeVisible()
+  await page.getByRole('link', { name: 'Upload', exact: true }).click()
+  await page.getByLabel('Choose Files').setInputFiles('public/images/CatSplash.png')
+  await expect(page.getByRole('heading', { name: 'Uploaded (1)' })).toBeVisible()
+  await page.getByRole('link', { name: 'Favorites', exact: true }).click()
+  await page.getByRole('tab', { name: 'My Uploads (1)' }).click()
+  await expect(page.getByAltText('CatSplash')).toBeVisible()
+  await page.getByRole('link', { name: 'Calendar', exact: true }).click()
+  await page.getByLabel('Calendar name').fill('Test Cats')
+  await page.getByLabel('Year', { exact: true }).fill('2028')
+  await page.getByRole('button', { name: 'Create', exact: true }).click()
+  await page.getByRole('button', { name: 'Pick photo for January', exact: true }).click()
+  await page.getByRole('button', { name: 'Select CatSplash' }).click()
+  await expect(page.getByText('1/12 photos assigned', { exact: true })).toBeVisible()
+  await page.getByLabel('Date', { exact: true }).fill('2028-02-29')
+  await page.getByLabel('Event title').fill('Leap day party')
+  await page.getByLabel('Emoji').fill('🎂')
+  await page.getByRole('button', { name: 'Add', exact: true }).click()
+  await expect(page.getByRole('cell', { name: '🎂 Leap day party', exact: true })).toBeVisible()
+  await expect(page.getByLabel('Event title')).toHaveValue('')
+  await page.getByRole('button', { name: 'Edit', exact: true }).click()
+  await page.getByLabel('Event title').fill('Leap day birthday')
+  await page.getByRole('button', { name: 'Update', exact: true }).click()
+  await page.getByRole('button', { name: 'Show preview', exact: true }).click()
+  await expect(page.locator('.calendar-month')).toHaveCount(12)
+  const printPromise = context.waitForEvent('page')
+  await page.getByRole('link', { name: 'Preview & Print', exact: true }).click()
+  const printPage = await printPromise
+  await expect(printPage.locator('.month-page')).toHaveCount(12)
+  await expect(printPage.getByRole('button', { name: '🖨 Print' })).toBeEnabled()
+  await expect(printPage.getByText('🎂 Leap day birthday', { exact: true })).toBeVisible()
+  await printPage.emulateMedia({ media: 'print' })
+  await expect(printPage.getByRole('navigation')).toBeHidden()
+  const pdf = await printPage.pdf({ preferCSSPageSize: true, printBackground: true })
+  expect(pdf.toString('latin1').match(/\/Type\s*\/Page\b/g)).toHaveLength(12)
+  await page.reload()
+  await page.getByRole('button', { name: 'Test Cats 2028' }).click()
+  await expect(page.getByText('1/12 photos assigned', { exact: true })).toBeVisible()
+  await expect(page.getByRole('cell', { name: '🎂 Leap day birthday', exact: true })).toBeVisible()
+  await page.getByRole('link', { name: 'Favorites', exact: true }).click()
+  await page.getByRole('tab', { name: 'My Uploads (1)' }).click()
+  await page.getByRole('button', { name: 'Remove from favorites' }).click({ force: true })
+  await expect(page.getByRole('tab', { name: 'My Uploads (0)' })).toBeVisible()
+  await page.getByRole('link', { name: 'Calendar', exact: true }).click()
+  await page.getByRole('button', { name: 'Test Cats 2028' }).click()
+  await expect(page.getByText('0/12 photos assigned', { exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Delete', exact: true }).click()
+  await expect(page.getByText('No events yet. Add important dates above.')).toBeVisible()
+  page.on('dialog', dialog => dialog.accept())
+  await page.getByRole('button', { name: 'Delete calendar Test Cats' }).click()
+  await expect(page.getByText('No calendars yet. Create one above to get started.')).toBeVisible()
+  expect(errors).toEqual([])
+})
+
+test('handles invalid print links and mobile navigation', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 })
+  await gotoHydrated(page, '/calendar/print?id=9999')
+  await expect(page.getByText(/Calendar not found/)).toBeVisible()
+  await page.getByRole('button', { name: 'Toggle navigation' }).click()
+  await page.getByRole('link', { name: 'Favorites', exact: true }).click()
+  await expect(page.getByRole('heading', { name: 'Favorites', exact: true })).toBeVisible()
+  await expect(page.getByText(/No favorited cats yet/)).toBeVisible()
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
+})
+
+test('browses, filters, paginates, retries errors, and saves API favorites', async ({ page }) => {
+  const requests: URL[] = []
+  let failImages = false
+  await page.route('**/api/cats/**', async route => {
+    const url = new URL(route.request().url())
+    if (url.pathname.endsWith('/breeds')) return route.fulfill({ json: [{ id: 'beng', name: 'Bengal' }] })
+    if (url.pathname.endsWith('/categories')) return route.fulfill({ json: [{ id: 1, name: 'Hats' }] })
+    requests.push(url)
+    if (failImages) return route.fulfill({ status: 502, json: { message: 'Unavailable' } })
+    const images = Array.from({ length: 20 }, (_, index) => ({ id: `cat-${index}`, url: '/images/CatSplash.png', breeds: [{ id: 'beng', name: 'Bengal' }] }))
+    return route.fulfill({ json: url.searchParams.get('page') === '1' ? [] : images })
+  })
+  await gotoHydrated(page, '/')
+  await page.getByRole('link', { name: 'Browse', exact: true }).first().click()
+  await expect(page.getByRole('button', { name: 'Add to favorites', exact: true })).toHaveCount(20)
+  await page.getByRole('button', { name: 'Add to favorites', exact: true }).first().click()
+  await expect(page.getByRole('button', { name: 'Remove from favorites', exact: true })).toHaveCount(1)
+  await page.getByLabel('Breed', { exact: true }).selectOption('beng')
+  await expect.poll(() => requests.at(-1)?.searchParams.get('breedId')).toBe('beng')
+  await page.getByLabel('Category', { exact: true }).selectOption('1')
+  await expect.poll(() => requests.at(-1)?.searchParams.get('categoryId')).toBe('1')
+  await page.getByLabel('With breed info').check()
+  await expect.poll(() => requests.at(-1)?.searchParams.get('hasBreeds')).toBe('true')
+  await page.getByRole('button', { name: 'Load More', exact: true }).click()
+  await expect(page.getByText('All 20 cats loaded')).toBeVisible()
+  failImages = true
+  await page.getByLabel('Order', { exact: true }).selectOption('ASC')
+  await expect.poll(() => requests.at(-1)?.searchParams.get('order')).toBe('ASC')
+  await expect(page.getByText('Failed to load cats. Please try again.')).toBeVisible()
+  failImages = false
+  await page.getByRole('button', { name: 'Retry', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Load More', exact: true })).toBeVisible()
+  await page.getByRole('button', { name: 'Reset', exact: true }).click()
+  await expect(page.getByLabel('Breed', { exact: true })).toHaveValue('')
+  await page.getByRole('link', { name: 'Favorites', exact: true }).click()
+  await expect(page.getByRole('tab', { name: 'Cat API (1)' })).toBeVisible()
+  await page.getByRole('button', { name: 'Remove from favorites', exact: true }).click({ force: true })
+  await expect(page.getByRole('tab', { name: 'Cat API (0)' })).toBeVisible()
+})
